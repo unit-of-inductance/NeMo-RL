@@ -3204,6 +3204,195 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
     cluster.shutdown()
 
 
+def _add_peft_to_test_config(
+    config: PolicyConfig, restore_from: Optional[str] = None
+) -> PolicyConfig:
+    """Enable Megatron PEFT (LoRA) on a create_megatron_test_config config.
+
+    Mirrors the enabled-peft shape used by tests/unit/models/megatron/
+    test_megatron_setup.py's TestPeftWarmStart._peft_cfg helper.
+    """
+    config["megatron_cfg"]["peft"] = {
+        "enabled": True,
+        "target_modules": ["linear_qkv", "linear_proj"],
+        "exclude_modules": [],
+        "dim": 8,
+        "alpha": 32,
+        "dropout": 0.0,
+        "dropout_position": "pre",
+        "lora_A_init_method": "xavier",
+        "lora_B_init_method": "zero",
+        "a2a_experimental": False,
+        "lora_dtype": None,
+        "restore_from": restore_from,
+    }
+    return config
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.hf_gated
+def test_megatron_lora_reference_policy_with_restore_from(tiny_llama_model_path):
+    """Value test: a restore_from donor anchors the reference, not the base model.
+
+    With peft.restore_from set, the reference policy must be the donor-warm-
+    started policy at step 0: its logprobs differ from the base model's AND
+    match the donor policy's own logprobs. This pins the semantics the
+    zero-LoRA fast path must never disturb: warm-started adapters are
+    non-trivial at init, so the reference must include them.
+    """
+    num_gpus = 2
+
+    with tempfile.TemporaryDirectory(prefix="lora_restore_from_") as temp_dir:
+        # ── Phase 1: train a donor LoRA policy and checkpoint it ──
+        config = _add_peft_to_test_config(
+            create_megatron_test_config(tiny_llama_model_path)
+        )
+        # Large LR so a few steps move the adapter weights decisively.
+        config["megatron_cfg"]["optimizer"]["lr"] = 1e-2
+        config["megatron_cfg"]["optimizer"]["min_lr"] = 1e-2
+
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        cluster = RayVirtualCluster(
+            name="test-lora-donor",
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 32000, (8, 64))
+        attention_mask = torch.ones(8, 64)
+        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+            }
+        )
+        train_data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+                "labels": torch.randint(0, 32000, (8, 64)),
+                "sample_mask": torch.ones(8),
+            }
+        )
+
+        # Fresh zero-init LoRA adapters contribute exactly nothing, so the
+        # donor policy's step-0 logprobs ARE the base model's. Capture them
+        # now; the warm-started reference later must differ from them.
+        policy.prepare_for_lp_inference()
+        base_model_logprobs = policy.get_logprobs(data)["logprobs"].cpu()
+
+        policy.prepare_for_training()
+        loss_fn = SimpleLossFn()
+        for _ in range(10):
+            policy.train(train_data, loss_fn)
+        policy.finish_training()
+
+        # The donor's own (adapted) logprobs: what the warm-started policy at
+        # step 0 of the next run must reproduce.
+        policy.prepare_for_lp_inference()
+        donor_logprobs = policy.get_logprobs(data)["logprobs"].cpu()
+
+        weights_path = os.path.join(temp_dir, "donor", "policy", "weights")
+        policy.save_checkpoint(
+            weights_path=weights_path,
+            is_final_checkpoint=True,
+        )
+        policy.finalize_async_save()
+        policy.shutdown()
+        cluster.shutdown()
+
+        # Locate the iter_* dir the bridge wrote; restore_from accepts the
+        # root too, but the iter dir is the canonical form.
+        iter_dirs = [d for d in os.listdir(weights_path) if d.startswith("iter_")]
+        assert iter_dirs, "Donor checkpoint has no iter_* directory"
+        donor_restore_dir = os.path.join(weights_path, sorted(iter_dirs)[-1])
+
+        # ── Phase 2: fresh policy warm-started from the donor ──
+        warm_config = _add_peft_to_test_config(
+            create_megatron_test_config(tiny_llama_model_path),
+            restore_from=donor_restore_dir,
+        )
+        warm_tokenizer = get_tokenizer(warm_config["tokenizer"])
+        warm_config["generation"] = configure_generation_config(
+            warm_config["generation"], warm_tokenizer
+        )
+
+        cluster2 = RayVirtualCluster(
+            name="test-lora-warm-start",
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+        warm_policy = Policy(
+            cluster=cluster2,
+            config=warm_config,
+            tokenizer=warm_tokenizer,
+            init_reference_model=True,
+        )
+
+        warm_policy.prepare_for_lp_inference()
+
+        # Step-0 reference logprobs. With restore_from set this takes the
+        # old path (second model, donor warm-start applied), which is
+        # exactly what this test pins.
+        reference_logprobs = warm_policy.get_reference_policy_logprobs(data)[
+            "reference_logprobs"
+        ].cpu()
+        # Step-0 policy logprobs: the live model with donor adapters active.
+        warm_policy_logprobs = warm_policy.get_logprobs(data)["logprobs"].cpu()
+
+        # The warm-started policy at step 0 IS the reference, so the two
+        # must agree...
+        torch.testing.assert_close(
+            reference_logprobs,
+            warm_policy_logprobs,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        # ...and both must reproduce the donor's trained logprobs (the
+        # adapters, not the bare base model, define the distribution).
+        max_diff = torch.max(torch.abs(donor_logprobs - reference_logprobs))
+        assert max_diff < 1e-3, (
+            "Donor and warm-started reference logprobs should match at step 0 "
+            f"(max diff {max_diff:.6f})"
+        )
+
+        # The warm-started reference must NOT equal the base model's
+        # logprobs. base_model_logprobs is the donor policy's step-0
+        # output, captured while its adapters were still zero-init; if
+        # the reference ever anchored to the bare base model instead of
+        # the donor adapters (e.g. the zero-LoRA fast path wrongly
+        # engaging on a restore_from run), this diff collapses to zero.
+        diff_from_base = torch.max(
+            torch.abs(base_model_logprobs - reference_logprobs)
+        ).item()
+        assert diff_from_base > 1e-3, (
+            "With restore_from, the reference must include the donor "
+            "adapters, not anchor to the bare base model "
+            f"(max diff from base: {diff_from_base})"
+        )
+
+        warm_policy.shutdown()
+        cluster2.shutdown()
+
+
 @pytest.mark.timeout(400)
 @pytest.mark.hf_gated
 @pytest.mark.parametrize(
