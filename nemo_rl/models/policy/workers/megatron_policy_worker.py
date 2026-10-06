@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 
 import ray
 import torch
+import torch.nn as nn
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
@@ -755,7 +756,24 @@ class MegatronPolicyWorkerImpl(
             get_model_config(self.model).param_sync_func = param_sync_func
 
         # Step 5: Setup reference model if needed
-        if init_reference_model:
+        # Zero-LoRA fast path: with PEFT enabled, no restore_from, and a
+        # zero-initialized lora_B, the LoRA delta is exactly zero at step 0,
+        # so the live model with LoRA adapters disabled is exactly the reference policy. 
+        # We skip the second model copy entirely; 
+        # reference logprobs are instead computed on the live model 
+        # with adapters disabled (see get_reference_policy_logprobs).
+        peft_cfg = config["megatron_cfg"].get("peft") or {}
+        self.reference_uses_base_model = (
+            init_reference_model
+            and bool(peft_cfg.get("enabled", False))
+            and peft_cfg.get("restore_from") is None
+            and peft_cfg.get("lora_B_init_method", "zero") == "zero"
+        )
+        if self.reference_uses_base_model:
+            log_gpu_memory_diagnostics(
+                label="after_ref_model", worker_type="MegatronPolicyWorker"
+            )
+        elif init_reference_model:
             self.model = self.move_model(self.model, "cpu")
             self.reference_state_dict = setup_reference_model_state(
                 config,
@@ -1466,6 +1484,64 @@ class MegatronPolicyWorkerImpl(
         if config is not None:
             config.moe_grad_scale_func = func
 
+    @contextmanager
+    def _use_base_model_as_reference(self):
+        """Context manager for the zero-LoRA reference mode.
+
+        Instead of swapping in a second model's weights, this disables the
+        LoRA adapters on the live model for the duration of the context, so
+        forward passes compute the base model. Re-enables the adapters in a
+        finally clause so an exception cannot leave the policy permanently
+        adapter-free (which would silently disable training updates).
+
+        The enable/disable walk is O(modules) per call, negligible next to a
+        forward pass, and stays outside the per-microbatch loop inside
+        get_logprobs by construction (the context wraps the whole call).
+        """
+        # Temporarily disable top-k/top-p filtering for reference policy
+        # logprobs, identical to use_reference_model(): the base model's
+        # top-k/top-p set is inherently different from the adapted policy's,
+        # so filtered logprobs would cause -inf mismatches that cannot be
+        # resolved by masking. Temperature scaling is kept since it was
+        # applied to prev_logprobs.
+        saved_sampling_params = self.sampling_params
+
+        model = self.model
+        disabled_modules: list[nn.Module] = []
+        try:
+            # Disable overlap param gather for the reference pass, mirroring
+            # use_reference_model(). The adapters are parameter leaves of the
+            # live model, so the DDP pre-hook must not fire while they are
+            # disabled.
+            if self.should_disable_forward_pre_hook:
+                self.disable_forward_pre_hook()
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,
+                    top_p=1.0,
+                    temperature=saved_sampling_params.temperature,
+                )
+
+            # Walk the (possibly PP-stage-listed, DDP/Float16Module-nested)
+            # model and flip _adapter_enabled off on every bridge
+            # AdapterWrapper. Same walk as
+            # megatron.bridge.peft.PEFT.disable_adapter_layers /
+            # tng/tools/lora/export_lora_adapter.py.
+            stack: list[nn.Module] = list(model) if isinstance(model, list) else [model]
+            while stack:
+                module = stack.pop()
+                if hasattr(module, "_adapter_enabled") and module._adapter_enabled:
+                    module.disable_adapter_layers()
+                    disabled_modules.append(module)
+                stack.extend(m for m in module.children() if m is not None)
+            yield
+        finally:
+            for module in disabled_modules:
+                module.enable_adapter_layers()
+            self.sampling_params = saved_sampling_params
+            if self.should_disable_forward_pre_hook:
+                self.enable_forward_pre_hook()
+
     @wrap_with_nvtx_name("megatron_policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
         self,
@@ -1473,7 +1549,21 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
-        with self.use_reference_model():
+        if self.reference_uses_base_model:
+            # Zero-LoRA fast path: the reference policy is the base model, so
+            # compute reference logprobs on the live model with the LoRA
+            # adapters disabled instead of swapping in a second model.
+            #
+            # Only lora_B is zero-initialized: `lora_B_init_method: zero`
+            # becomes `init_method_const(0.0)` on the adapter's `linear_out`
+            # (Megatron-Bridge `peft/utils.py`, the `"zero"` branch of
+            # `_get_init_fn`), while lora_A keeps its xavier draw. The delta
+            # the adapter adds is `scale * linear_out(activation(linear_in(x)))`,
+            # so a zero lora_B zeroes the product however lora_A is drawn.
+            reference_ctx = self._use_base_model_as_reference()
+        else:
+            reference_ctx = self.use_reference_model()
+        with reference_ctx:
             reference_logprobs = self.get_logprobs(
                 data=data,
                 micro_batch_size=micro_batch_size,
