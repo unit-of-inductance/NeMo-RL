@@ -46,6 +46,50 @@ refit transports, and checkpoint-engine/NIXL transports. Eagle/MTP draft
 weights refitted from the trainer are not supported yet; use the legacy loader
 for those cases.
 
+## Adapter-Only Payload
+
+The default refit payload merges LoRA factors into the base weights on the
+trainer and ships the full model. For LoRA runs this repeats a lot of frozen
+work every step. `refit_payload_mode: adapter_delta` streams only the LoRA
+`lora_A`/`lora_B` factors instead, and the vLLM receiver merges them into its
+live base weights in place with `base += (alpha / dim) * (B @ A)`. The merge
+reproduces the trainer-side arithmetic, so the served weights match the
+`hf_export` path.
+
+Enable it when the per-step payload is too large to move within the refit
+budget: a ~234 GiB full export for a large 512-expert MoE is the motivating
+example from the design work. The adapter payload is the LoRA factors alone,
+hundreds of MiB to a few GiB depending on the number of target modules and
+the rank. The base model must be frozen, which LoRA training already
+guarantees.
+
+Set `refit_payload_mode` and leave `refit_transport: null`:
+
+```yaml
+policy:
+  generation:
+    colocated:
+      enabled: false
+    refit_transport: null
+    vllm_cfg:
+      refit_payload_mode: adapter_delta  # default hf_export, unchanged behavior
+      refit_adapter_scaling: 2.0         # alpha / dim from megatron_cfg.peft
+```
+
+The adapter scaling is `alpha / dim` of the run's LoRA config. The receiver
+refuses to merge with an assumed default. Both the legacy drivers and the
+Single-Controller setup derive it from `policy.megatron_cfg.peft` at setup, so
+there is normally nothing to set by hand; set it explicitly only in configs
+that bypass those setup paths.
+
+Constraints:
+
+- Policy backend must be Megatron. The source side is Bridge's
+  `export_adapter_weights`.
+- Transport must be the collective, `refit_transport: null`. Other transports
+  apply weights with overwrite semantics and would silently drop the
+  `lora_A`/`lora_B` names. The config validation refuses them.
+
 ## Constraints
 
 | Transport | Generation backend | Policy backend | Quantization and MoE |
