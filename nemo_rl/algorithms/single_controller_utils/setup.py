@@ -1083,6 +1083,23 @@ def setup_single_controller(
 
         check_nccl_reshard_refit_support(master_config)
 
+    # Same story as the nccl_reshard guard above: the adapter-delta refit setup
+    # (scaling derivation from the policy's LoRA config, plus the collective-only
+    # transport guard) ran only in the grpo/ppo/distillation setup paths, none of
+    # which the single-controller entrypoint goes through. Without this, an
+    # adapter_delta SC run hard-errors at the receiver's first refit, which
+    # refuses to merge with an assumed default scaling, and a non-collective
+    # transport is never refused. Both helpers mutate/validate this same
+    # generation_config dict, which _build_generation re-reads below.
+    if generation_config.get("backend") == "vllm":
+        from nemo_rl.models.generation.vllm.config import (
+            apply_refit_payload_mode_defaults,
+            normalize_vllm_refit_config,
+        )
+
+        apply_refit_payload_mode_defaults(generation_config, policy_config)
+        normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+
     if algo_cfg.val_period > 0 or algo_cfg.val_at_start or algo_cfg.val_at_end:
         raise NotImplementedError(
             "SingleController doesn't support validation now, will support "

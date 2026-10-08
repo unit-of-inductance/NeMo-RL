@@ -718,6 +718,51 @@ class TestSetup:
             mc.policy["generation"]["nvfp4_pertoken_rollout"] = rollout
         validate_single_controller_config(mc)
 
+    def test_adapter_delta_derives_scaling_before_setup_factories(
+        self, patched_factories
+    ):
+        """SC setup derives refit_adapter_scaling like the grpo/ppo drivers."""
+        mc = _make_master_config(megatron_enabled=True)
+        mc.policy["generation"]["vllm_cfg"] = {"refit_payload_mode": "adapter_delta"}
+        mc.policy["megatron_cfg"]["peft"] = {"enabled": True, "dim": 64, "alpha": 128}
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.policy["generation"]["vllm_cfg"]["refit_adapter_scaling"] == 2.0, (
+            "setup must derive alpha/dim into vllm_cfg before workers are built"
+        )
+        patched_factories["_build_generation"].assert_called_once()
+
+    def test_adapter_delta_rejects_missing_lora_config_before_setup_factories(
+        self, patched_factories
+    ):
+        mc = _make_master_config(megatron_enabled=True)
+        mc.policy["generation"]["vllm_cfg"] = {"refit_payload_mode": "adapter_delta"}
+
+        with pytest.raises(ValueError, match="peft.enabled=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        for factory in ("setup_response_data", "_build_clusters", "_build_generation"):
+            patched_factories[factory].assert_not_called()
+
+    def test_adapter_delta_rejects_non_collective_transport_before_setup_factories(
+        self, patched_factories
+    ):
+        """The collective-only transport guard fires on the SC path too."""
+        mc = _make_master_config(megatron_enabled=True)
+        mc.policy["generation"]["refit_transport"] = "vllm_zmq_sparse"
+        mc.policy["generation"]["vllm_cfg"] = {
+            "refit_payload_mode": "adapter_delta",
+            "refit_adapter_scaling": 2.0,
+        }
+        mc.policy["megatron_cfg"]["peft"] = {"enabled": True, "dim": 64, "alpha": 128}
+
+        with pytest.raises(ValueError, match="only supported.*collective"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        for factory in ("setup_response_data", "_build_clusters", "_build_generation"):
+            patched_factories[factory].assert_not_called()
+
     def test_reward_penalties_are_typed(self):
         assert isinstance(_make_master_config().reward_penalties, RewardPenaltyConfig)
 
