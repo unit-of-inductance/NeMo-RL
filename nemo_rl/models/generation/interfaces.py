@@ -25,7 +25,13 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 # backend-independent representation that each destination converts locally.
 # logical_weights is a Megatron-to-Megatron exception, read only by the Megatron
 # policy worker; new backends should not inherit that coupling implicitly.
-RefitPayloadMode = Literal["hf_export", "logical_weights"]
+# adapter_delta ships only the LoRA lora_A/lora_B factors in HF naming
+# (Bridge's export_adapter_weights); the receiving backend merges them into
+# its live base weights in place. Both sides must know the mode: the source
+# switches its export iterator, the receiver its apply hook, because vLLM's
+# native loader overwrites and would silently drop lora_* names it does not
+# recognize.
+RefitPayloadMode = Literal["hf_export", "logical_weights", "adapter_delta"]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig

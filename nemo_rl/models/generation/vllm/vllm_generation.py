@@ -44,6 +44,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitPayloadMode,
 )
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -362,6 +363,10 @@ class VllmGeneration(GenerationInterface):
         # any run that never loses one -- so absence is a real value, not a missing one,
         # and it should not be discovered with getattr at the read site.
         self._refit_membership: Optional["RefitMembership"] = None
+        # Same reasoning as _refit_membership above: set only by set_refit_membership
+        # (i.e. by recovery), so False for the whole life of a run that never loses
+        # a shard. get_refit_payload_mode reads it directly, not via getattr.
+        self._force_full_refit_once: bool = False
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -885,8 +890,30 @@ class VllmGeneration(GenerationInterface):
         ``run_all_workers_*``, which walks the whole worker group. Left alone they would
         keep calling the dead shard's Ray actor after the rebuild and fail the refit with
         RayActorError, so the run would still die, just differently.
+
+        Membership only changes through recovery, so this is also where the
+        force-full-refit latch is set: an aborted adapter-delta merge leaves
+        the base half-merged, and the merge is not idempotent. The next refit
+        must be a complete ``hf_export`` one before adapter mode resumes.
         """
         self._refit_membership = membership
+        self._force_full_refit_once = True
+
+    def get_refit_payload_mode(self) -> RefitPayloadMode:
+        """Return the configured payload mode, or a forced full refit.
+
+        The latch set by ``set_refit_membership`` (recovery only) makes the
+        next prepared refit a complete ``hf_export`` regardless of config,
+        then consumes itself. The weight synchronizer re-prepares the normal
+        mode after that full refit completes, so adapter mode resumes.
+        """
+        if self._force_full_refit_once:
+            self._force_full_refit_once = False
+            return "hf_export"
+        return cast(
+            RefitPayloadMode,
+            self.cfg["vllm_cfg"].get("refit_payload_mode", "hf_export"),
+        )
 
     def _refit_leader_workers(self) -> list[Any]:
         """DP leaders that should receive refit calls, in rank order.

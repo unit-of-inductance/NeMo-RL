@@ -115,6 +115,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._stale = True
         # What the communicator was last built over. None until init_communicator.
         self._built_membership: Optional[RefitMembership] = None
+        # Set by reconcile_communicator. A recovery invalidates the receiver's
+        # base weights (an aborted adapter-delta merge is partial and not
+        # idempotent), so the generation's forced full refit must complete
+        # before the configured payload mode is re-prepared.
+        self._post_recovery_full_refit_pending = False
 
     def sync_weights(
         self,
@@ -166,6 +171,17 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 )
 
         self._stale = False
+
+        if self._post_recovery_full_refit_pending:
+            # The refit that just completed was the forced full one that
+            # recovery prepared. Re-prepare the configured payload mode on
+            # both sides (metadata only, no weights on the wire) so the next
+            # refit resumes it instead of silently staying full forever.
+            self._post_recovery_full_refit_pending = False
+            state_dict_info = self._policy.prepare_refit_info(
+                refit_payload_mode=self._generation.get_refit_payload_mode()
+            )
+            self._generation.prepare_refit_info(state_dict_info)
 
     @property
     def is_stale(self) -> bool:
@@ -353,6 +369,12 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
         self._built_membership = membership
+        # The generation's payload-mode latch made the reconcile's re-prepare
+        # a full hf_export one. Remember that, so the first successful refit
+        # after this rebuild re-prepares the configured mode before the next
+        # dispatch and adapter-delta refits resume instead of silently
+        # staying full forever.
+        self._post_recovery_full_refit_pending = True
         return True
 
     def shutdown(self) -> None:

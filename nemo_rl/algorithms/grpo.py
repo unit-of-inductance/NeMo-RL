@@ -134,6 +134,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    apply_refit_payload_mode_defaults,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
@@ -1618,6 +1619,10 @@ def setup(
 
         ## make vllm hf overrides match the training policy
         vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+
+        # Derive refit_adapter_scaling (alpha/dim) from the policy's LoRA
+        # config; the receiver only sees the generation subtree.
+        apply_refit_payload_mode_defaults(generation_config, policy_config)
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the

@@ -525,6 +525,17 @@ class BaseVllmGenerationWorker:
     def _refit_with_reload_api_enabled(self) -> bool:
         return bool(self.cfg["vllm_cfg"].get("refit_with_reload_api"))
 
+    def _refit_payload_mode(self) -> str:
+        """Payload mode the trainer will stream; must match the policy side."""
+        return str(self.cfg["vllm_cfg"].get("refit_payload_mode", "hf_export"))
+
+    def _refit_adapter_scaling(self) -> float | None:
+        """Plumbed ``alpha / dim`` for adapter-delta merges, or None."""
+        scaling = self.cfg["vllm_cfg"].get("refit_adapter_scaling")
+        if scaling is None:
+            return None
+        return float(scaling)
+
     @umbrella_trace_fn(RLSpanGroup.U_MODEL_INIT, "rl.vllm.load_model")
     def _load_model(self, bundle_indices, seed):
         """Perform the heavy model loading and engine creation.
@@ -1395,7 +1406,14 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
-        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(
+                state_dict_info,
+                self._refit_payload_mode(),
+                self._refit_adapter_scaling(),
+            ),
+        )
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:

@@ -90,6 +90,7 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    apply_refit_payload_mode_defaults,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
@@ -915,6 +916,10 @@ def setup(
         generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
             "hf_config_overrides", {}
         )
+
+        # Derive refit_adapter_scaling (alpha/dim) from the policy's LoRA
+        # config; the receiver only sees the generation subtree.
+        apply_refit_payload_mode_defaults(generation_config, policy_config)
 
         policy_generation, policy, value_model = initialize_generation_with_policy(
             init_generation_fn=init_vllm,

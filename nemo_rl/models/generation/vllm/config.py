@@ -123,6 +123,18 @@ class VllmSpecificArgs(TypedDict):
     # False so existing IPC/NCCL refit behavior keeps using NeMo-RL's legacy
     # loader path.
     refit_with_reload_api: NotRequired[bool]
+    # Payload representation the trainer streams during refit. ``adapter_delta``
+    # ships only LoRA factors and merges them in place on the receiver;
+    # ``hf_export`` (default) ships the full merged weights and stays the
+    # byte-identical historical path.
+    refit_payload_mode: NotRequired[
+        Literal["hf_export", "logical_weights", "adapter_delta"]
+    ]
+    # ``alpha / dim`` of the run's LoRA config. Required when
+    # refit_payload_mode is ``adapter_delta``; the receiver refuses to merge
+    # with an assumed default. The driver derives it from
+    # policy_config.megatron_cfg.peft at setup.
+    refit_adapter_scaling: NotRequired[float]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
 
@@ -469,6 +481,53 @@ def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
         )
 
 
+def apply_refit_payload_mode_defaults(
+    generation_config: VllmConfig,
+    policy_config: dict[str, Any],
+) -> None:
+    """Derive adapter-refit settings the receiver cannot infer on its own.
+
+    ``vllm_cfg.refit_payload_mode`` selects the streamed representation and is
+    read by both the trainer (via ``get_refit_payload_mode``) and the receiver,
+    so the run config stays the single source of truth. The receiver sees only
+    the ``policy.generation`` subtree, so ``alpha / dim`` must be merged into
+    ``vllm_cfg`` here, at driver setup, next to the ``hf_overrides`` merge.
+
+    Fail-loud rules: adapter mode requires an enabled LoRA config with both
+    ``alpha`` and ``dim`` present. An unset mode stays untouched so the
+    default ``hf_export`` path remains byte-identical.
+    """
+    vllm_cfg = generation_config.get("vllm_cfg") or {}
+    mode = vllm_cfg.get("refit_payload_mode")
+    if mode is None:
+        return
+    if mode not in ("hf_export", "logical_weights", "adapter_delta"):
+        raise ValueError(
+            f"generation.vllm_cfg.refit_payload_mode={mode!r} is not one of "
+            "'hf_export', 'logical_weights', 'adapter_delta'"
+        )
+    if mode != "adapter_delta":
+        return
+    if vllm_cfg.get("refit_adapter_scaling") is not None:
+        return
+    peft_cfg = (policy_config.get("megatron_cfg") or {}).get("peft") or {}
+    if not peft_cfg.get("enabled", False):
+        raise ValueError(
+            "generation.vllm_cfg.refit_payload_mode='adapter_delta' requires "
+            "megatron_cfg.peft.enabled=true; without LoRA the trainer has no "
+            "adapters to stream."
+        )
+    dim = peft_cfg.get("dim")
+    alpha = peft_cfg.get("alpha")
+    if not dim or not alpha:
+        raise ValueError(
+            "refit_payload_mode='adapter_delta' requires megatron_cfg.peft.dim "
+            "and megatron_cfg.peft.alpha to derive refit_adapter_scaling; "
+            "the receiver refuses to merge with an assumed default."
+        )
+    vllm_cfg["refit_adapter_scaling"] = float(alpha) / float(dim)
+
+
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
     rollout = parse_nvfp4_pertoken_rollout(config)
@@ -507,6 +566,20 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
             "does not reset the multimodal encoder cache, so stale multimodal "
             "embeddings would silently survive weight updates. Supported "
             "transports: null (collective/IPC) and 'nccl_reshard'."
+        )
+    # adapter_delta is implemented only on the collective packed broadcast:
+    # every other transport applies payloads with overwrite semantics that
+    # would silently drop lora_A/lora_B names (or ship a full merged model
+    # while the receiver latched adapter metadata), both of which serve
+    # stale weights while appearing to succeed. nccl_reshard already
+    # refuses on the worker (prepare_nccl_reshard_refit_info); the sparse
+    # and checkpoint-engine transports are refused here.
+    if vllm_cfg and vllm_cfg.get("refit_payload_mode") == "adapter_delta":
+        raise ValueError(
+            "vllm_cfg.refit_payload_mode='adapter_delta' is only supported "
+            f"with refit_transport=null (collective), not {transport!r}: "
+            "other transports apply weights with overwrite semantics that "
+            "cannot merge LoRA factors in place."
         )
     refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
     if ":" in transport:

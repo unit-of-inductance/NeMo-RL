@@ -28,6 +28,12 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     resolve_rollout_rank,
 )
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
+from nemo_rl.models.generation.vllm.vllm_adapter_delta import (
+    LORA_A_SUFFIX,
+    LORA_B_SUFFIX,
+    _AdapterDeltaApplier,
+    _format_refit_key_error,
+)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -62,13 +68,6 @@ except ImportError:
 WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
 UnsupportedNativeRefitTransport = Literal["checkpoint_engine", "sparse_delta"]
 WeightUpdateFinalizer = Callable[[], None]
-
-
-def _format_refit_key_error(label: str, keys: set[str]) -> str:
-    """Format a bounded refit-key diagnostic."""
-    ordered = sorted(keys)
-    suffix = " ..." if len(ordered) > 8 else ""
-    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
 
 
 class IPCWeightManifestError(RuntimeError):
@@ -712,19 +711,63 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        refit_payload_mode: str = "hf_export",
+        refit_adapter_scaling: float | None = None,
+    ) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
         Args:
             state_dict_info (dict): A dictionary containing the info for refit.
                 e.g. {tensor_name: (shape, dtype)}
+            refit_payload_mode: Payload representation the trainer will send.
+                ``adapter_delta`` streams LoRA factors instead of merged weights;
+                every streamed name must then be a ``lora_A``/``lora_B`` record.
+            refit_adapter_scaling: ``alpha / dim`` for adapter-delta merges.
+                Required in adapter mode, ignored otherwise.
 
         Raises:
             RuntimeError: If the model realizes the unquantized FlashInfer TRTLLM
                 MoE backend while a co-trained MTP drafter is enabled (unsupported
                 by the native layerwise refit lifecycle).
+            ValueError: If adapter mode is requested with metadata that does not
+                match an adapter-only payload, or without a scaling factor.
         """
         self._validate_native_layerwise_refit()
+        if refit_payload_mode not in ("hf_export", "logical_weights", "adapter_delta"):
+            raise ValueError(
+                f"Unknown refit_payload_mode {refit_payload_mode!r}; expected one of "
+                "'hf_export', 'logical_weights', 'adapter_delta'"
+            )
+        if refit_payload_mode == "adapter_delta":
+            if not state_dict_info:
+                raise ValueError(
+                    "adapter_delta refit requested but the export is empty"
+                )
+            bad_names = [
+                name
+                for name in state_dict_info
+                if not (name.endswith(LORA_A_SUFFIX) or name.endswith(LORA_B_SUFFIX))
+            ]
+            if bad_names:
+                raise ValueError(
+                    "adapter_delta refit metadata contains non-adapter names; "
+                    f"first offenders {_format_refit_key_error('mismatched', set(bad_names))}. "
+                    "The trainer and receiver disagree on the payload mode."
+                )
+            if refit_adapter_scaling is None or refit_adapter_scaling <= 0:
+                raise ValueError(
+                    "adapter_delta refit requires a positive refit_adapter_scaling "
+                    "(alpha / dim); refusing to merge with an assumed default"
+                )
+        self.refit_payload_mode = (
+            refit_payload_mode  # pyrefly: ignore[implicitly-defined-attribute]
+        )
+        self.refit_adapter_scaling = (
+            refit_adapter_scaling  # pyrefly: ignore[implicitly-defined-attribute]
+        )
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     def prepare_sparse_delta_refit_info(
@@ -1057,6 +1100,41 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         # MTP drafters co-trained with the policy receive their weights from the
         # policy stream (no `draft.` prefix), so feed it the policy weights too.
         self._maybe_refit_mtp_drafter(policy_weights)
+
+    def _adapter_delta_post_unpack(self) -> Callable[[list], None]:
+        """Build a fresh per-refit adapter-delta applier and return its hook.
+
+        Called once per ``_update_weights_from_collective`` in adapter mode; the
+        instance lives on the extension only so the post-stream ``finish()``
+        can validate that every streamed factor found its sibling and its
+        parameter.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            raise RuntimeError(
+                "adapter_delta refits are not supported on FP8/quantized "
+                "serving models; the in-place merge would corrupt the "
+                "quantized layouts. Use the default hf_export payload."
+            )
+        scaling = getattr(self, "refit_adapter_scaling", None)
+        if scaling is None:
+            raise RuntimeError(
+                "adapter_delta refit requested but no refit_adapter_scaling "
+                "was recorded by prepare_refit_info"
+            )
+        model = self.model_runner.model
+        param_storages = {
+            param.untyped_storage()._cdata
+            for _, param in model.named_parameters(recurse=True)
+        }
+        applier = _AdapterDeltaApplier(
+            load_weights=model.load_weights,
+            param_storages=param_storages,
+            scaling=float(scaling),
+        )
+        self._adapter_delta_applier = applier
+        return applier.post_unpack
 
     def _get_sparse_delta_applier(self) -> Any:
         if self._sparse_delta_applier is None:
@@ -1601,6 +1679,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
         )
+        refit_payload_mode = getattr(self, "refit_payload_mode", "hf_export")
 
         if refit_with_reload_api and self._uses_deepseek_v4_fp8_refit():
             raise RuntimeError(
@@ -1608,6 +1687,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "because it bypasses the model's prepare/finalize refit hooks. "
                 "Set refit_with_reload_api=False to use the supported "
                 "collective refit lifecycle."
+            )
+        if refit_with_reload_api and refit_payload_mode == "adapter_delta":
+            raise RuntimeError(
+                "adapter_delta refits cannot use refit_with_reload_api=True: "
+                "the reload API overwrites parameters from a full checkpoint "
+                "stream, which would discard the in-place merge semantics."
             )
 
         try:
@@ -1640,17 +1725,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             close_weight_iterator()
             else:
                 native_layerwise_refit = self._uses_native_layerwise_refit("collective")
+                if refit_payload_mode == "adapter_delta":
+                    post_unpack_func = self._adapter_delta_post_unpack()
+                else:
+                    post_unpack_func = self._load_weights
                 with self._weight_update_lifecycle("collective") as finalize:
                     packed_broadcast_consumer(
                         iterator=iter(self.state_dict_info.items()),
                         group=self.model_update_group,
                         src=0,
-                        post_unpack_func=self._load_weights,
+                        post_unpack_func=post_unpack_func,
                         # Double buffering (num_buffers > 1) causes a race condition
                         # when using native_layerwise_refit: deferred weight_loader
                         # replays may read a buffer while the other stream refills it.
                         num_buffers=1 if native_layerwise_refit else None,
                     )
+                    if refit_payload_mode == "adapter_delta":
+                        self._adapter_delta_applier.finish()
                     finalize()
 
         except Exception as e:

@@ -2948,6 +2948,48 @@ class MegatronPolicyWorkerImpl(
             [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
         )
 
+    def _iter_adapter_delta_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield only the LoRA lora_A/lora_B tensors in HF naming.
+
+        The ``adapter_delta`` refit mode walks Bridge's
+        ``export_adapter_weights`` instead of the merged ``export_hf_weights``:
+        the base model is frozen under LoRA training, so only the adapter
+        factors change between refits. Names follow the HF LoRA suffix map
+        (``.linear_in.weight`` -> ``.lora_A.weight``, ``.linear_out.weight`` ->
+        ``.lora_B.weight``, peft_bridge.py:94-95) and tensors arrive in the
+        training dtype on CPU, ready for the packed broadcast.
+
+        Grouped-expert adapters arrive either per-HF-name stacked 3D tensors
+        (packed-expert export) or shared ``[1, ...]`` factors; the receiver's
+        resolver owns mapping them onto its fused expert layout, so no shape
+        interpretation happens here.
+        """
+        assert self.megatron_bridge is not None, (
+            "adapter_delta refit requires the Megatron bridge, which is only "
+            "present after finalize_megatron_setup"
+        )
+        adapter_iter = self.megatron_bridge.export_adapter_weights(
+            [self.model],
+            show_progress=False,
+            # The receiver pairs factors by exact HF name and merges 2D
+            # against 2D (or 3D against 3D). With share_expert_adapters=True
+            # (the Bridge default) the shared side would otherwise arrive
+            # once as a [1, ...] tensor under an expert-agnostic name while
+            # its sibling arrives per-expert -- unpairable. Expanding the
+            # shared factor under every expert's name keeps both halves of
+            # each pair addressable by the same name.
+            expand_shared_outer=True,
+        )
+        for name, tensor in adapter_iter:
+            yield name, tensor
+
+    def _iter_refit_payload_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Pick the export iterator for the currently selected refit payload mode."""
+        if self.refit_payload_mode == "adapter_delta":
+            yield from self._iter_adapter_delta_params()
+            return
+        yield from self._iter_params_with_optional_kv_scales()
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def _prepare_source_refit_info(
@@ -2958,10 +3000,33 @@ class MegatronPolicyWorkerImpl(
         self.refit_payload_mode = refit_payload_mode
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
+        if refit_payload_mode == "adapter_delta":
+            if self._is_fp8_export():
+                raise ValueError(
+                    "adapter_delta refit payload mode is not supported with FP8 "
+                    "(blockwise) training export: the adapter stream is BF16 "
+                    "LoRA factors and the receiving merge assumes an unquantized "
+                    "base. Use the default hf_export payload instead."
+                )
+
         # Collect tensor metadata for refit / hf side info.
         refit_param_info_hf = {}
-        for name, tensor in self._iter_params_with_optional_kv_scales():
+        for name, tensor in self._iter_refit_payload_params():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+
+        if refit_payload_mode == "adapter_delta" and not refit_param_info_hf:
+            # The export walks the adapter modules; empty means the model was
+            # trained without LoRA or every adapter was excluded. Merging an
+            # empty delta is a no-op refit that silently serves stale weights,
+            # so refuse the mode instead. Bridge raises on its own when the
+            # model has no adapters at all (save_hf_adapter's example), but an
+            # exclude list can also empty the set without that error.
+            raise ValueError(
+                "adapter_delta refit selected but the adapter export is empty; "
+                "the policy has no trainable LoRA adapters to send. Use "
+                "hf_export, or check megatron_cfg.peft.target_modules/"
+                "exclude_modules."
+            )
 
         return refit_param_info_hf
 
@@ -3599,6 +3664,16 @@ class MegatronPolicyWorkerImpl(
         self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
+        if self.refit_payload_mode == "adapter_delta":
+            # The IPC consumer applies payloads through vLLM's overwrite-style
+            # loader; lora_A/lora_B names would be silently dropped, so an
+            # adapter-mode IPC stream would serve stale weights while appearing
+            # to succeed. The collective receiver owns the merge path.
+            raise ValueError(
+                "adapter_delta refit payload mode is not supported on the "
+                "IPC/ZMQ transport; use the collective transport "
+                "(refit_transport: null)."
+            )
         self.maybe_init_zmq()
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
@@ -3658,8 +3733,17 @@ class MegatronPolicyWorkerImpl(
         num_buffers: Optional[int] = None,
     ) -> None:
         # param_iterator will return (name, tensor), we only need tensor.
+        # adapter_delta switches the stream to the adapter-only export; its
+        # payload never carries KV scales, so kv_scales is ignored there and
+        # metadata/broadcast stay in sync through _iter_refit_payload_params.
+        if self.refit_payload_mode == "adapter_delta":
+            payload_iter = self._iter_refit_payload_params()
+        else:
+            payload_iter = self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales
+            )
         packed_broadcast_producer(
-            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
+            iterator=payload_iter,
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
@@ -3773,6 +3857,13 @@ class MegatronPolicyWorkerImpl(
         its own fused layout (e.g., vLLM w13/w2) gen-side, so this train worker
         stays agnostic to any gen backend's MoE-fusion layout.
         """
+        if refit_payload_mode == "adapter_delta":
+            raise ValueError(
+                "adapter_delta refit payload mode is only implemented for the "
+                "collective packed-broadcast transport, not nccl_reshard. The "
+                "reshard builder consumes a full merged export; route adapter "
+                "deltas through refit_transport: null instead."
+            )
         self.refit_payload_mode = refit_payload_mode
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
