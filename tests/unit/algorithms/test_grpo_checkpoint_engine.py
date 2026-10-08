@@ -75,6 +75,33 @@ def test_reset_encoder_cache_flag_rejected_on_unsupported_refit_transports():
             normalize_vllm_refit_config(_config(transport))
 
 
+def test_adapter_delta_rejected_on_non_collective_refit_transports():
+    """adapter_delta needs the collective packed broadcast; nothing else merges."""
+    import pytest
+
+    from nemo_rl.models.generation.vllm.config import (
+        VllmConfig,
+        normalize_vllm_refit_config,
+    )
+
+    def _config(transport):
+        return cast(
+            VllmConfig,
+            {
+                "vllm_cfg": {"refit_payload_mode": "adapter_delta"},
+                "refit_transport": transport,
+            },
+        )
+
+    # The collective packed broadcast is the one supported transport.
+    assert normalize_vllm_refit_config(_config(None)) is None
+
+    # Overwrite-semantics transports would drop the LoRA names silently.
+    for transport in ("nixl", "vllm_s3_sparse", "vllm_zmq_sparse", "custom:Engine"):
+        with pytest.raises(ValueError, match="refit_payload_mode='adapter_delta'"):
+            normalize_vllm_refit_config(_config(transport))
+
+
 def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
     from nemo_rl.algorithms import grpo as grpo_mod
     from nemo_rl.models.generation.vllm import VllmGeneration

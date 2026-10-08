@@ -740,6 +740,114 @@ class TestCollectiveWeightSynchronizer:
             num_buffers=2,
         )
 
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_reconcile_latches_full_refit_then_reprepares_configured_mode(
+        self, mock_ray
+    ):
+        """Recovery flow: one forced full refit, then the configured mode resumes.
+
+        reconcile_communicator records that the refit it prepared was the
+        forced full one; the first successful sync_weights afterwards must
+        re-run the prepare pair with the normal mode exactly once, and no
+        later sync may re-prepare again.
+        """
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.get_refit_payload_mode.return_value = "adapter_delta"
+        sync = CollectiveWeightSynchronizer(
+            policy, gen, _mock_cluster(), _mock_cluster()
+        )
+        sync.init_communicator()
+
+        sync.reconcile_communicator(absent_shards=[1])
+        assert sync._post_recovery_full_refit_pending
+
+        # First successful sync after recovery consumes the pending bit and
+        # re-prepares with the generation's (now unlatched) mode.
+        sync.sync_weights()
+        assert not sync._post_recovery_full_refit_pending
+        assert (
+            policy.prepare_refit_info.call_args.kwargs.get("refit_payload_mode")
+            == "adapter_delta"
+        )
+        gen.prepare_refit_info.assert_called_with(
+            policy.prepare_refit_info.return_value
+        )
+
+        # Steady state: further syncs do not re-prepare.
+        policy.prepare_refit_info.reset_mock()
+        sync.sync_weights()
+        policy.prepare_refit_info.assert_not_called()
+
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_failed_sync_keeps_full_refit_pending(self, mock_ray):
+        """A refit that raises must not clear the pending full-refit bit."""
+
+        def fake_get(futures, *_args, **_kwargs):
+            # Every future settles "successfully"; the sync's own success
+            # check (all(result for ...)) sees False and raises.
+            if isinstance(futures, list):
+                return [False] * len(futures)
+            return futures
+
+        mock_ray.get.reset_mock()
+        mock_ray.get.side_effect = fake_get
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = CollectiveWeightSynchronizer(
+            policy, gen, _mock_cluster(), _mock_cluster()
+        )
+        sync.init_communicator()
+        mock_ray.get.reset_mock()
+        sync.reconcile_communicator(absent_shards=[1])
+
+        with pytest.raises(RuntimeError, match="Weight transfer failed"):
+            sync.sync_weights()
+        assert sync._post_recovery_full_refit_pending
+
+
+# ---------------------------------------------------------------------------
+# Recovery payload-mode latch (VllmGeneration)
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryPayloadModeLatch:
+    """set_refit_membership (recovery-only) forces one full hf_export refit."""
+
+    @staticmethod
+    def _generation(vllm_cfg):
+        from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+        gen = object.__new__(VllmGeneration)
+        gen.cfg = {"vllm_cfg": vllm_cfg}
+        # __init__ normally sets this; object.__new__ skips __init__ entirely.
+        gen._force_full_refit_once = False
+        return gen
+
+    def test_unlatched_reads_configured_mode(self):
+        gen = self._generation({"refit_payload_mode": "adapter_delta"})
+        assert gen.get_refit_payload_mode() == "adapter_delta"
+
+    def test_default_mode_is_hf_export(self):
+        gen = self._generation({})
+        assert gen.get_refit_payload_mode() == "hf_export"
+
+    def test_membership_latch_forces_one_full_refit_then_consumes(self):
+        gen = self._generation({"refit_payload_mode": "adapter_delta"})
+        gen.set_refit_membership(object())
+        # Consume-on-read: exactly one forced full refit...
+        assert gen.get_refit_payload_mode() == "hf_export"
+        # ...then the configured mode resumes.
+        assert gen.get_refit_payload_mode() == "adapter_delta"
+        assert gen.get_refit_payload_mode() == "adapter_delta"
+
+    def test_latch_survives_when_config_already_full(self):
+        gen = self._generation({})
+        gen.set_refit_membership(object())
+        gen.get_refit_payload_mode()
+        assert not gen._force_full_refit_once
+
 
 # ---------------------------------------------------------------------------
 # NcclReshardWeightSynchronizer

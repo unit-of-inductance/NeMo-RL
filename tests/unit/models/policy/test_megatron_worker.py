@@ -5114,3 +5114,115 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+class TestAdapterDeltaSourceExport:
+    """Source-side payload selection for the adapter_delta refit mode."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_nvtx_ranges(self):
+        """Bridge's export generators and the worker's refit entry points push
+        NVTX ranges, which raise on a CPU-only torch build. Replace the range
+        hooks with no-ops; on a CUDA build this patch is equally harmless."""
+        original_push = torch.cuda.nvtx.range_push
+        original_pop = torch.cuda.nvtx.range_pop
+        torch.cuda.nvtx.range_push = lambda name: 0
+        torch.cuda.nvtx.range_pop = lambda: None
+        yield
+        torch.cuda.nvtx.range_push = original_push
+        torch.cuda.nvtx.range_pop = original_pop
+
+    @staticmethod
+    def _adapter_worker(adapter_names):
+        """Build a minimal source worker with a mocked bridge export."""
+        from nemo_rl.models.policy.workers.megatron_policy_worker import (
+            MegatronPolicyWorkerImpl,
+        )
+
+        worker = object.__new__(MegatronPolicyWorkerImpl)
+        worker.model = object()
+        worker.draft_model = None
+        worker.refit_conversion_tasks = []
+        worker.fp8_cfg = None
+        worker.cfg = {"generation": {"backend": "vllm"}}
+        tensors = [(name, torch.zeros(2, 2)) for name in adapter_names]
+        worker.megatron_bridge = SimpleNamespace(
+            export_adapter_weights=MagicMock(return_value=iter(tensors)),
+            export_hf_weights=MagicMock(
+                return_value=iter((("base.weight", torch.zeros(2, 2)),))
+            ),
+            get_conversion_tasks=MagicMock(return_value=[]),
+        )
+        worker._calculate_refit_param_info = MagicMock(return_value=[])
+        return worker
+
+    def test_adapter_delta_walks_export_adapter_weights(self) -> None:
+        worker = self._adapter_worker(["model.layers.0.qkv_proj.lora_A.weight"])
+        info = worker.prepare_refit_info(refit_payload_mode="adapter_delta")
+        worker.megatron_bridge.export_adapter_weights.assert_called_once()
+        worker.megatron_bridge.export_hf_weights.assert_not_called()
+        assert set(info) == {"model.layers.0.qkv_proj.lora_A.weight"}
+        shape, dtype = info["model.layers.0.qkv_proj.lora_A.weight"]
+        assert tuple(shape) == (2, 2)
+        assert dtype == torch.float32
+
+    def test_adapter_delta_expands_shared_outer_loras(self) -> None:
+        """Shared expert factors must arrive per-expert, not as one [1, ...].
+
+        The receiver pairs factors by exact HF name: a shared side emitted
+        once under an expert-agnostic name has no per-expert sibling to
+        pair with, so the source must expand it (share_expert_adapters is
+        the Bridge default).
+        """
+        worker = self._adapter_worker(
+            ["model.layers.0.moe.experts.3.gate_proj.lora_A.weight"]
+        )
+        worker.prepare_refit_info(refit_payload_mode="adapter_delta")
+        kwargs = worker.megatron_bridge.export_adapter_weights.call_args.kwargs
+        assert kwargs.get("expand_shared_outer") is True
+
+    def test_adapter_delta_rejects_empty_export(self) -> None:
+        worker = self._adapter_worker([])
+        with pytest.raises(ValueError, match="adapter export is empty"):
+            worker.prepare_refit_info(refit_payload_mode="adapter_delta")
+
+    def test_adapter_delta_rejects_fp8_training_export(self) -> None:
+        worker = self._adapter_worker(["model.layers.0.qkv_proj.lora_A.weight"])
+        worker.fp8_cfg = {"fp8_param": True, "fp8_recipe": "blockwise"}
+        with pytest.raises(ValueError, match="not supported with FP8"):
+            worker.prepare_refit_info(refit_payload_mode="adapter_delta")
+
+    def test_hf_export_default_unchanged(self) -> None:
+        worker = self._adapter_worker(["model.layers.0.qkv_proj.lora_A.weight"])
+        info = worker.prepare_refit_info(refit_payload_mode="hf_export")
+        worker.megatron_bridge.export_hf_weights.assert_called_once()
+        worker.megatron_bridge.export_adapter_weights.assert_not_called()
+        assert set(info) == {"base.weight"}
+
+    def test_broadcast_iter_matches_mode(self) -> None:
+        """The packed-broadcast producer must consume the same iterator the
+        metadata pass used, or wire and metadata diverge silently."""
+        seen: list[str] = []
+
+        def fake_producer(iterator, **kwargs):
+            for name, _tensor in iterator:
+                seen.append(name)
+
+        worker = self._adapter_worker(["x.lora_A.weight", "x.lora_B.weight"])
+        worker.refit_payload_mode = "adapter_delta"
+        import nemo_rl.models.policy.workers.megatron_policy_worker as mpw
+
+        original = mpw.packed_broadcast_producer
+        mpw.packed_broadcast_producer = fake_producer
+        try:
+            worker._broadcast_weights_for_collective()
+        finally:
+            mpw.packed_broadcast_producer = original
+        assert seen == ["x.lora_A.weight", "x.lora_B.weight"]
+
+    def test_ipc_zmq_refuses_adapter_delta(self) -> None:
+        worker = self._adapter_worker([])
+        worker.refit_payload_mode = "adapter_delta"
+        worker.maybe_init_zmq = MagicMock()
+        with pytest.raises(ValueError, match="not supported on the IPC/ZMQ"):
+            worker.stream_weights_via_ipc_zmq()
